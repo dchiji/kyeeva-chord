@@ -45,12 +45,16 @@ server() ->
 init([nil]) ->
     State = #state {
         myhash = myhash(),
-        succlist = lists:duplicate(?LENGTH_SUCCESSOR_LIST, nil)
+        succlist = #succlist {
+            bigger_len = 0,
+            bigger = [],
+            smaller = []
+        }
     },
     {ok, State};
 init([InitNode]) ->
     case net_adm:ping(InitNode) of
-        pong -> init_successor_list(InitNode);
+        pong -> {ok, init_successor_list(InitNode)};
         pang -> {error, {not_found, InitNode}}
     end.
 
@@ -60,12 +64,9 @@ init_successor_list(InitNode) ->
         myhash = MyHash
     },
     case rpc:call(InitNode, ?MODULE, server, []) of
-        {ok, InitServer} -> {ok, State#state{succlist=init_join(InitServer, MyHash)}};
+        {ok, InitServer} -> State#state{succlist=gen_server:call(InitServer, {join_op, MyHash})};
         {badrpc, Reason} -> {stop, Reason}
     end.
-
-init_join(InitServer, MyHash) ->
-    gen_server:call(InitServer, {join_op, MyHash}).
 
 
 %%--------------------------------------------------------------------
@@ -130,22 +131,52 @@ code_change(_, State, _) ->
 %% called by handle_call/3
 %%====================================================================
 join_op(NewHash, From, MyHash, MySuccList) ->
-    case next(NewHash, MySuccList) of
+    {S_or_B, SuccList, Len} = if
+        NewHash > MyHash -> {bigger, MySuccList#succlist.bigger, MySuccList#succlist.bigger_len};
+        NewHash < MyHash -> {smaller, MySuccList#succlist.smaller, ?LENGTH_SUCCESSOR_LIST - MySuccList#succlist.bigger_len}
+    end,
+    case next(S_or_B, NewHash, SuccList, Len) of
         self ->
-            {NewServer, _} = From,
-            join_op_1(From, MySuccList, [{NewServer, NewHash} | MySuccList]);
-        {nil, self, N} ->
-            {NewServer, _} = From,
-            join_op_1(From, replace(N, MySuccList, {whereis(?MODULE), MyHash}), [{NewServer, NewHash} | MySuccList]);
+            join_op_1(S_or_B, NewHash, From, MySuccList, MySuccList);
+        shortage ->
+            join_op_shortage(S_or_B, NewHash, From, MyHash, MySuccList);
+        {error, Reason} ->
+            gen_server:reply(From, {error, Reason}),
+            MySuccList;
         {OtherNode, _} ->
             gen_server:cast(OtherNode, {join_op_cast, NewHash, From}),
             MySuccList
     end.
 
-join_op_1(From, MySuccList, NewSuccList) ->
-    gen_server:reply(From, MySuccList),
-    io:format("[~p] successor list = ~p~n", [self(), NewSuccList]),
-    NewSuccList.
+join_op_shortage(bigger, NewHash, From, MyHash, MySuccList) ->
+    ResultSuccList = MySuccList#succlist {
+        bigger_len = MySuccList#succlist.bigger_len + 1,
+        bigger = MySuccList#succlist.bigger ++ [{whereis(?MODULE), MyHash}]
+    },
+    join_op_1(bigger, NewHash, From, MySuccList, ResultSuccList);
+join_op_shortage(smaller, NewHash, From, MyHash, MySuccList) ->
+    ResultSuccList = MySuccList#succlist {
+        bigger_len = MySuccList#succlist.bigger_len - 1,
+        smaller = MySuccList#succlist.smaller ++ [{whereis(?MODULE), MyHash}]
+    },
+    join_op_1(smaller, NewHash, From, MySuccList, ResultSuccList).
+
+join_op_1(S_or_B, NewHash, From, MySuccList, ResultSuccList) ->
+    gen_server:reply(From, ResultSuccList),
+    join_op_2(S_or_B, NewHash, From, MySuccList).
+
+join_op_2(bigger, NewHash, From, MySuccList) ->
+    {NewServer, _} = From,
+    MySuccList#succlist {
+        bigger_len = MySuccList#succlist.bigger_len + 1,
+        bigger = [{NewServer, NewHash} | MySuccList#succlist.bigger]
+    };
+join_op_2(smaller, NewHash, From, MySuccList) ->
+    {NewServer, _} = From,
+    MySuccList#succlist {
+        bigger_len = MySuccList#succlist.bigger_len - 1,
+        bigger = [{NewServer, NewHash} | MySuccList#succlist.bigger]
+    }.
 
 
 lookup_op() ->
@@ -161,28 +192,28 @@ myhash() ->
     crypto:sha(list_to_binary(atom_to_list(node()))).
 
 
-next(NewHash, [{_, Hash} | _]) when NewHash > Hash ->
-    self;
-next(_, [nil | _]) ->
-    {nil, self, 1};
-next(NewHash, SuccList) ->
-    next_1(NewHash, SuccList, 1).
-
-next_1(_, [Peer | _], ?LENGTH_SUCCESSOR_LIST) ->
-    Peer;
-next_1(_, [Peer, nil | _], _) ->
-    Peer;
-next_1(NewHash, [{_, NewHash} | _], _) ->
+next(_, NewHash, [{_, NewHash} | _], _) ->
     {error, equal_hash};
-next_1(NewHash, [{Server, Hash} | _], _) when NewHash > Hash ->
+next(bigger, NewHash, [{_, Hash} | _], _) when NewHash > Hash ->
+    self;
+next(smaller, NewHash, [{_, Hash} | _], _) when NewHash < Hash ->
+    self;
+next(_, _, [], _) ->
+    shortage;
+next(S_or_B, NewHash, SuccList, Len) ->
+    next_1(S_or_B, NewHash, SuccList, Len, 1).
+
+next_1(_, _, [Peer | _], Len, Len) ->
+    Peer;
+next_1(_, _, [_Peer], Len, Count) when Count /= Len->
+    shortage;
+
+next_1(bigger, NewHash, [{Server, Hash} | _], _, _) when NewHash > Hash ->
     {Server, Hash};
-next_1(NewHash, [{_, Hash} | Tail], Count) when NewHash < Hash ->
-    next_1(NewHash, Tail, Count + 1).
+next_1(bigger, NewHash, [{_, Hash} | Tail], Len, Count) when NewHash < Hash ->
+    next_1(bigger, NewHash, Tail, Len, Count + 1);
 
-
-replace(_, [], _) ->
-    [];
-replace(1, [_ | Tail], Y) ->
-    [Y | Tail];
-replace(N, [X | Tail], Y) ->
-    [X | replace(N - 1, Tail, Y)].
+next_1(smaller, NewHash, [{Server, Hash} | _], _, _) when NewHash < Hash ->
+    {Server, Hash};
+next_1(smaller, NewHash, [{_, Hash} | Tail], Len, Count) when NewHash > Hash ->
+    next_1(smaller, NewHash, Tail, Len, Count + 1).

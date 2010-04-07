@@ -7,6 +7,7 @@
 %% API
 -export([start/0,
         start/1,
+        lookup/1,
         server/0]).
 
 %% gen_server callbacks
@@ -25,7 +26,15 @@ start() ->
     start(nil).
 
 start(InitNode) ->
+    spawn(fun() ->
+                ets:new(store, [named_table, set, public]),
+                timer:sleep(infinity)
+        end),
     gen_server:start({local, ?MODULE}, ?MODULE, [InitNode], []).
+
+
+lookup(Key) ->
+    gen_server:call(?MODULE, {lookup_op, Key}).
 
 
 server() ->
@@ -81,6 +90,10 @@ init_successor_list(InitNode) ->
 handle_call({join_op, NewHash}, From, State) ->
     {noreply, State#state{succlist=join_op(NewHash, From, State#state.myhash, State#state.succlist)}};
 
+handle_call({lookup_op, Key}, From, State) ->
+    spawn(?MODULE, lookup_op, [Key, State#state.myhash, From, State#state.succlist]),
+    {noreply, State};
+
 handle_call(_, _, State) ->
     {noreply, State}.
 
@@ -93,6 +106,10 @@ handle_call(_, _, State) ->
 %%--------------------------------------------------------------------
 handle_cast({join_op_cast, NewHash, From}, State) ->
     {noreply, State#state{succlist=join_op(NewHash, From, State#state.myhash, State#state.succlist)}};
+
+handle_cast({lookup_op_cast, Key, From}, State) ->
+    spawn(?MODULE, lookup_op, [Key, State#state.myhash, From, State#state.succlist]),
+    {noreply, State};
 
 handle_cast(_, State) ->
     {noreply, State}.
@@ -130,15 +147,15 @@ code_change(_, State, _) ->
 %%====================================================================
 %% called by handle_call/3
 %%====================================================================
+%%--------------------------------------------------------------------
+%% join operation
+%%--------------------------------------------------------------------
 join_op(NewHash, From, MyHash, MySuccList) ->
-    {S_or_B, SuccList, Len} = if
-        NewHash > MyHash -> {bigger, MySuccList#succlist.bigger, MySuccList#succlist.bigger_len};
-        NewHash < MyHash -> {smaller, MySuccList#succlist.smaller, ?LENGTH_SUCCESSOR_LIST - MySuccList#succlist.bigger_len}
-    end,
+    {S_or_B, SuccList, Len} = select_succlist(NewHash, MyHash, MySuccList),
     case next(S_or_B, NewHash, SuccList, Len) of
         self ->
             join_op_1(S_or_B, NewHash, From, MySuccList, MySuccList);
-        shortage ->
+        {shortage, _} ->
             join_op_shortage(S_or_B, NewHash, From, MyHash, MySuccList);
         {error, Reason} ->
             gen_server:reply(From, {error, Reason}),
@@ -179,8 +196,27 @@ join_op_2(smaller, NewHash, From, MySuccList) ->
     }.
 
 
-lookup_op() ->
-    pass.
+%%--------------------------------------------------------------------
+%% lookup operation
+%%--------------------------------------------------------------------
+%% spawned funtion
+lookup_op(Key, MyHash, From, SuccList) ->
+    Hash = crypto:sha(term_to_binary(Key)),
+    {S_or_B, SuccList1, Len} = select_succlist(Hash, MyHash, SuccList),
+    io:format("~p, ~p~n", [S_or_B, SuccList]),
+    case next(S_or_B, Hash, SuccList1, Len) of
+        self                       -> lookup_op_1(Key, From);
+        {shortage, self}           -> lookup_op_1(Key, From);
+        {shortage, {OtherNode, _}} -> gen_server:cast(OtherNode, {lookup_op_cast, Key, From});
+        {error, Reason}            -> gen_server:reply(From, {error, Reason});
+        {OtherNode, _}             -> gen_server:cast(OtherNode, {lookup_op_cast, Key, From})
+    end.
+
+lookup_op_1(Key, From) ->
+    case ets:lookup(store, Key) of
+        [] -> gen_server:reply(From, {error, {not_found, Key}});
+        [{Key, Value}] -> gen_server:reply(From, {ok, {Key, Value}})
+    end.
 
 
 %%====================================================================
@@ -189,7 +225,7 @@ lookup_op() ->
 myhash() ->
     crypto:start(),
     crypto:sha_init(),
-    crypto:sha(list_to_binary(atom_to_list(node()))).
+    crypto:sha(term_to_binary(node())).
 
 
 next(_, NewHash, [{_, NewHash} | _], _) ->
@@ -199,14 +235,14 @@ next(bigger, NewHash, [{_, Hash} | _], _) when NewHash > Hash ->
 next(smaller, NewHash, [{_, Hash} | _], _) when NewHash < Hash ->
     self;
 next(_, _, [], _) ->
-    shortage;
+    {shortage, self};
 next(S_or_B, NewHash, SuccList, Len) ->
     next_1(S_or_B, NewHash, SuccList, Len, 1).
 
 next_1(_, _, [Peer | _], Len, Len) ->
     Peer;
-next_1(_, _, [_Peer], Len, Count) when Count /= Len->
-    shortage;
+next_1(_, _, [Peer], Len, Count) when Count /= Len->
+    {shortage, Peer};
 
 next_1(bigger, NewHash, [{Server, Hash} | _], _, _) when NewHash > Hash ->
     {Server, Hash};
@@ -217,3 +253,9 @@ next_1(smaller, NewHash, [{Server, Hash} | _], _, _) when NewHash < Hash ->
     {Server, Hash};
 next_1(smaller, NewHash, [{_, Hash} | Tail], Len, Count) when NewHash > Hash ->
     next_1(smaller, NewHash, Tail, Len, Count + 1).
+
+
+select_succlist(Hash1, Hash2, SuccList) when Hash1 > Hash2 ->
+    {bigger, SuccList#succlist.bigger, SuccList#succlist.bigger_len};
+select_succlist(Hash1, Hash2, SuccList) when Hash1 < Hash2 ->
+    {smaller, SuccList#succlist.smaller, ?LENGTH_SUCCESSOR_LIST - SuccList#succlist.bigger_len}.
